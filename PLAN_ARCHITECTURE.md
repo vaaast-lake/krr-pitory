@@ -407,7 +407,7 @@ end
 return 1
 ```
 
-`packages/redis-client`에 두 함수로 추상화한다.
+`fulfillment-server/src/redis/`에 두 함수로 추상화한다. Redis Lua script는 fulfillment-server만 사용하므로 공유 패키지가 아닌 서버 내부에 위치한다.
 
 ```typescript
 decrementStock(items: { productId: string; quantity: number }[]): Promise<{ success: boolean; failedIndex?: number }>
@@ -659,20 +659,29 @@ k6                → 실시간 메트릭 스트리밍    → Grafana
 
 **모노레포 (pnpm workspace)**
 
-이벤트 페이로드 타입을 `packages/event-types`로 공유. 서버 간 타입 불일치 방지.
+packages/에는 **여러 서버가 동시에 같은 값을 써야 하고, 달라지면 런타임 버그가 생기는 것**만 넣는다.
 
 ```
 krr-pitory/
   apps/
     source-server/
+      src/
+        kafka/       KafkaModule, cancel-group 상수, producer
+        redis/       RedisModule, pending TTL 로직
+        rabbitmq/    RabbitMQModule, notification.review consumer
     fulfillment-server/
+      src/
+        kafka/       KafkaModule, fulfillment-group 상수, producer/consumer
+        redis/       RedisModule, Lua script (DECR/INCR), idempotency key
+        rabbitmq/    RabbitMQModule, seller dispatch, DLQ 초기화
     analytics-server/
+      src/
+        kafka/       KafkaModule, analytics-group 상수, consumer
   packages/
-    event-types/        이벤트 페이로드 Zod 스키마 + 타입 추론 (3개 서버 공유)
-    kafka-client/       공통 Kafka 설정, 토픽 상수
-    rabbitmq-client/    공통 RabbitMQ 설정, DLQ 초기화
-    redis-client/       공통 Redis 설정, Lua script
-    tsconfig/           공통 TypeScript 설정
+    event-types/     Zod 스키마 + 타입 (3개 서버 공유 — 불일치 시 파싱 실패)
+    kafka-client/    토픽 이름 상수 (3개 서버 공유 — 불일치 시 이벤트 미전달)
+    rabbitmq-client/ notification.review 큐 이름 상수 (source/fulfillment 공유)
+    tsconfig/        공통 TypeScript 설정
   scripts/
     seed-reference.ts      고정 참조 데이터 각 서버 DB 적재
     seed-inventory.ts      product별 초기 재고 Redis + inventory 테이블 적재
@@ -687,6 +696,16 @@ krr-pitory/
   docker-compose.yml
   .env                     SPEED_FACTOR, SAMPLE_SIZE 등 공통 환경변수
 ```
+
+**packages/ 분류 기준**
+
+| 패키지 | 공유 서버 | 공유 내용 | packages/ 이유 |
+| ------ | --------- | --------- | -------------- |
+| event-types | 3개 전체 | Zod 스키마, 타입 | 불일치 시 파싱 실패 |
+| kafka-client | 3개 전체 | 토픽 이름 상수 | 불일치 시 이벤트 미전달 |
+| rabbitmq-client | source, fulfillment | `notification.review` 큐 이름 상수 | 불일치 시 메시지 미전달 |
+
+연결 설정, consumer group 상수, Lua script, DLQ 초기화는 한 서버만 쓰거나 서버별로 달라야 하므로 각 서버 내부 모듈에 위치한다.
 
 **packages/event-types 구조**
 
@@ -899,21 +918,21 @@ docker-compose 서비스 목록
 - [ ] 모노레포 초기 세팅 (pnpm workspace, tsconfig 공통화, .npmrc node-linker=hoisted, .env 공통 환경변수)
 - [ ] docker-compose 인프라 구성 (Kafka KRaft, RabbitMQ + 플러그인, Redis, PostgreSQL × 3) + 헬스체크 검증
 - [ ] packages/event-types 정의 (Zod 스키마 + 타입 추론: order.created / order.processed / order.canceled / review.created)
-- [ ] packages/kafka-client, rabbitmq-client (DLQ 초기화 포함), redis-client (멀티키 DECR/INCR Lua script, decrementStock/incrementStock 함수) 공통 설정
+- [ ] packages/kafka-client (토픽 이름 상수), packages/rabbitmq-client (notification.review 큐 이름 상수) 정의
 - [ ] scripts/seed-reference.ts (sellers, products, customers, geolocation → 각 서버 DB)
 - [ ] scripts/seed-inventory.ts (order_items 빈도 기반 초기 재고 → Redis + inventory 테이블)
 - [ ] scripts/prepare-simulation.ts (CSV 조인 + 필터링 + 이벤트 시퀀스 변환 → events.json, target 필드 포함)
 - [ ] source-server 구현
-  - 주문 API, Redis pending 버퍼 (SPEED_FACTOR 기반 동적 TTL)
-  - 결제 승인 API (payments 테이블 저장 + Kafka order.created 발행, eventId UUID 생성)
-  - 취소 API (Kafka order.canceled(customer_request) 발행)
-  - 리뷰 API (order_reviews 저장 + Kafka review.created 발행)
+  - src/redis: RedisModule, pending TTL (SPEED_FACTOR 기반 동적 TTL)
+  - src/kafka: KafkaModule, cancel-group 상수, order.created 발행 (eventId UUID 생성), order.canceled(customer_request) 발행, review.created 발행
+  - src/rabbitmq: RabbitMQModule, notification.review consumer → notification_log 기록
+  - 주문 API, 결제 승인 API, 취소 API, 리뷰 API
   - Kafka cancel-group: order.canceled 소비 → 환불 처리 + notification_log 기록
-  - RabbitMQ consumer: notification.review 소비 → notification_log 기록
 - [ ] fulfillment-server 구현
-  - Kafka fulfillment-group: order.created 소비
+  - src/kafka: KafkaModule, fulfillment-group 상수, order.created 소비, order.processed 발행, order.canceled 발행/소비
+  - src/redis: RedisModule, 멀티키 Lua script (DECR/INCR), idempotency key, 주문 상태 캐시
+  - src/rabbitmq: RabbitMQModule, 셀러별 동적 큐 dispatch (x-expires), DLQ 초기화, notification.review delayed 발행
   - Redis 멀티키 Lua script 재고 차감 (all-or-nothing) + inventory 배치 UPDATE
-  - RabbitMQ 셀러별 동적 큐 dispatch (x-expires 설정) + DLQ
   - PATCH /orders/:id/ship: fulfillment_events(shipped) 기록 + Redis 캐시 SET
   - PATCH /orders/:id/deliver: fulfillment_events(delivered) 기록 + Kafka order.processed 발행 + RabbitMQ notification.review delayed 발행
   - Kafka order.canceled(customer_request) 소비 → fulfillment_events processing 레코드 확인 후 조건부 멀티키 INCR
