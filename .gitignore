@@ -2,3 +2,44 @@
 archive*
 
 ai-sessions
+
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+coverage/
+*.tsbuildinfo
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Logs and runtime files
+*.log
+*.pid
+*.pid.lock
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Tool caches
+.cache/
+.eslintcache
+.turbo/
+
+# Generated simulation data
+/simulation/data/events.json
+
+# Raw dataset
+/archive/
+/archive.zip
+
+# Local AI sessions
+/ai-sessions/
+
+# OS files
+.DS_Store
+Thumbs.db
