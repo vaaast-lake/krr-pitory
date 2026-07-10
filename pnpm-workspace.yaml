@@ -2,6 +2,9 @@ packages:
   - "apps/*"
   - "packages/*"
 
+allowBuilds:
+  unrs-resolver: true
+
 catalog:
   "@nestjs/common": 11.x
   "@nestjs/core": 11.x
