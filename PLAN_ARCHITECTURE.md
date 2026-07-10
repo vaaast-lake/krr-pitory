@@ -750,10 +750,22 @@ export type OrderCanceledEvent = z.infer<typeof OrderCanceledSchema>
 
 **pnpm 이슈 대응**
 
+`node-linker`는 기본값 `isolated`를 유지한다. 공유 의존성 버전은 `pnpm-workspace.yaml`의 `catalog`로 고정한다.
+
+```yaml
+# pnpm-workspace.yaml
+packages:
+  - "apps/*"
+  - "packages/*"
+
+catalog:
+  "@nestjs/common": 11.x
+  "@nestjs/core": 11.x
+  reflect-metadata: 0.2.x
+  rxjs: 7.x
 ```
-# .npmrc
-node-linker=hoisted   # 기본 설정. NestJS CLI 호환성 확보
-```
+
+`packages/event-types`, `packages/kafka-client`, `packages/rabbitmq-client`는 Zod 스키마와 문자열 상수만 export하며 `@nestjs/*`에 의존하지 않는다. 모듈 탐색 오류가 실제로 재현되면 그때 해당 패키지만 `public-hoist-pattern`으로 선택적으로 노출한다.
 
 ---
 
