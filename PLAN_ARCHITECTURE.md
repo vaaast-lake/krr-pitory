@@ -711,42 +711,78 @@ krr-pitory/
 
 Zod 스키마를 정의하면 타입 추론과 런타임 검증을 동시에 확보한다. Kafka/RabbitMQ 메시지 파싱 시 형태가 맞지 않으면 즉시 에러 → DLQ 연동 가능.
 
+Olist 원본 CSV를 전수 검증한 결과를 반영한다 (동일 product+seller 반복 주문 7,088건 → quantity 필요, 복수결제 주문 2,961건·혼합 결제수단 2,246건 → payment 배열화, items/payments 빈 배열 주문 존재 → `.min(1)`로 방어, delivered 주문은 estimatedDeliveryAt이 전부 존재 → non-nullable).
+
 ```typescript
 // packages/event-types/src/events.ts
+const ItemSchema = z.object({
+  productId: z.string(),
+  sellerId: z.string(),
+})
+
+const PaymentTypeSchema = z.enum(['credit_card', 'boleto', 'voucher', 'debit_card', 'not_defined'])
+
 export const OrderCreatedSchema = z.object({
-  eventId:    z.string().uuid(),   // source-server가 Kafka 발행 시 생성
-  orderId:    z.string(),
-  items: z.array(z.object({
-    productId: z.string(),
-    sellerId:  z.string(),
-    price:     z.number(),
-  })),
-  payment: z.object({
-    type:         z.string(),   // credit_card | boleto | voucher | debit_card
-    value:        z.number(),
-    installments: z.number().int(),
-  }),
-  occurredAt: z.string().datetime(),
-  type:       z.literal('order.created'),
+  eventId: z.uuid(),   // source-server가 Kafka 발행 시 생성, idempotency key로도 사용
+  orderId: z.string(),
+  items: z.array(
+    ItemSchema.extend({
+      price: z.number(),
+      quantity: z.number().int().positive(),
+    }),
+  ).min(1),
+  payments: z.array(
+    z.object({
+      sequential: z.number().int().positive(),   // payment_sequential, 주문당 최대 29건
+      type: PaymentTypeSchema,
+      value: z.number().nonnegative(),           // 0원 결제 9건 존재
+      installments: z.number().int().nonnegative(),
+    }),
+  ).min(1),
+  occurredAt: z.iso.datetime(),
+  type: z.literal('order.created'),
 })
 export type OrderCreatedEvent = z.infer<typeof OrderCreatedSchema>
 
 export const OrderCanceledSchema = z.object({
-  eventId:   z.string().uuid(),
-  orderId:   z.string(),
-  reason:    z.enum(['customer_request', 'stock_unavailable']),
-  items: z.array(z.object({
-    productId: z.string(),
-    sellerId:  z.string(),
-    quantity:  z.number().int(),
-  })),
-  occurredAt: z.string().datetime(),
-  type:       z.literal('order.canceled'),
+  eventId: z.uuid(),
+  orderId: z.string(),
+  reason: z.enum(['customer_request', 'stock_unavailable']),
+  items: z.array(
+    ItemSchema.extend({
+      quantity: z.number().int().positive(),
+    }),
+  ).min(1),
+  occurredAt: z.iso.datetime(),
+  type: z.literal('order.canceled'),
 })
 export type OrderCanceledEvent = z.infer<typeof OrderCanceledSchema>
 
-// order.processed, review.created 동일 패턴
+export const OrderProcessedSchema = z.object({
+  eventId: z.uuid(),
+  orderId: z.string(),
+  items: z.array(ItemSchema).min(1),
+  shippedAt: z.iso.datetime(),
+  deliveredAt: z.iso.datetime(),
+  estimatedDeliveryAt: z.iso.datetime(),   // delivered 주문엔 항상 존재, 누락 행은 prepare-simulation에서 제외
+  occurredAt: z.iso.datetime(),
+  type: z.literal('order.processed'),
+})
+export type OrderProcessedEvent = z.infer<typeof OrderProcessedSchema>
+
+export const ReviewCreatedSchema = z.object({
+  eventId: z.uuid(),
+  orderId: z.string(),
+  reviewId: z.string(),   // 전역 유일하지 않음(789개 중복, 서로 다른 주문). idempotency key는 eventId 사용
+  reviewScore: z.number().int().min(1).max(5),
+  sellerIds: z.array(z.string()).min(1),   // 멀티 셀러 주문 리뷰 귀속용
+  occurredAt: z.iso.datetime(),
+  type: z.literal('review.created'),
+})
+export type ReviewCreatedEvent = z.infer<typeof ReviewCreatedSchema>
 ```
+
+날짜 원본 형식(`2017-10-02 11:07:15`)은 ISO 8601이 아니므로 `scripts/prepare-simulation.ts`에서 타임존 정책을 정해 변환한다. 취소 시각 생성 규칙, 시간 역전·누락 행 필터링도 동일하게 `prepare-simulation.ts` 책임이다.
 
 **pnpm 이슈 대응**
 
@@ -927,20 +963,20 @@ docker-compose 서비스 목록
 
 ## 14. 구현 순서
 
-- [ ] 모노레포 초기 세팅 (pnpm workspace, tsconfig 공통화, .npmrc node-linker=hoisted, .env 공통 환경변수)
+- [ ] 모노레포 초기 세팅 (pnpm workspace ✓, tsconfig 공통화 ✓ — 루트 `tsconfig.base.json` + `catalog`, .env 공통 환경변수 미완료)
 - [ ] docker-compose 인프라 구성 (Kafka KRaft, RabbitMQ + 플러그인, Redis, PostgreSQL × 3) + 헬스체크 검증
-- [ ] packages/event-types 정의 (Zod 스키마 + 타입 추론: order.created / order.processed / order.canceled / review.created)
+- [x] packages/event-types 정의 (Zod 스키마 + 타입 추론: order.created / order.processed / order.canceled / review.created — Olist 원본 전수 검증 반영)
 - [ ] packages/kafka-client (토픽 이름 상수), packages/rabbitmq-client (notification.review 큐 이름 상수) 정의
 - [ ] scripts/seed-reference.ts (sellers, products, customers, geolocation → 각 서버 DB)
 - [ ] scripts/seed-inventory.ts (order_items 빈도 기반 초기 재고 → Redis + inventory 테이블)
 - [ ] scripts/prepare-simulation.ts (CSV 조인 + 필터링 + 이벤트 시퀀스 변환 → events.json, target 필드 포함)
-- [ ] source-server 구현
+- [ ] source-server 구현 (NestJS 스캐폴드 생성 완료, 모듈 구현 전)
   - src/redis: RedisModule, pending TTL (SPEED_FACTOR 기반 동적 TTL)
   - src/kafka: KafkaModule, cancel-group 상수, order.created 발행 (eventId UUID 생성), order.canceled(customer_request) 발행, review.created 발행
   - src/rabbitmq: RabbitMQModule, notification.review consumer → notification_log 기록
   - 주문 API, 결제 승인 API, 취소 API, 리뷰 API
   - Kafka cancel-group: order.canceled 소비 → 환불 처리 + notification_log 기록
-- [ ] fulfillment-server 구현
+- [ ] fulfillment-server 구현 (NestJS 스캐폴드 생성 완료, 모듈 구현 전)
   - src/kafka: KafkaModule, fulfillment-group 상수, order.created 소비, order.processed 발행, order.canceled 발행/소비
   - src/redis: RedisModule, 멀티키 Lua script (DECR/INCR), idempotency key, 주문 상태 캐시
   - src/rabbitmq: RabbitMQModule, 셀러별 동적 큐 dispatch (x-expires), DLQ 초기화, notification.review delayed 발행
@@ -949,7 +985,7 @@ docker-compose 서비스 목록
   - PATCH /orders/:id/deliver: fulfillment_events(delivered) 기록 + Kafka order.processed 발행 + RabbitMQ notification.review delayed 발행
   - Kafka order.canceled(customer_request) 소비 → fulfillment_events processing 레코드 확인 후 조건부 멀티키 INCR
   - Kafka order.canceled(stock_unavailable) 소비 → 스킵 (내부에서 이미 처리 완결)
-- [ ] analytics-server 구현
+- [ ] analytics-server 구현 (NestJS 스캐폴드 생성 완료, 모듈 구현 전)
   - Kafka analytics-group: 모든 토픽 소비
   - delivery_stats: order.processed 소비 시 직접 INSERT
   - seller_performance: 인메모리 버퍼 누적 + 5초마다 배치 flush
